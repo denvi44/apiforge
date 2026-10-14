@@ -1,0 +1,8 @@
+# Interface
+flet==0.28.3
+# Exécution locale de l'API générée (même interpréteur)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+# Tests de bout en bout (TestClient)
+httpx>=0.27
