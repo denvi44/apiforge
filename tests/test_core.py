@@ -18,9 +18,22 @@ HAS_FASTAPI = all(importlib.util.find_spec(m) for m in ("fastapi", "httpx"))
 KEY = "k" * 32
 
 
+JWT = "j" * 48
+ADMIN = {"ADMIN_EMAIL": "admin@exemple.fr", "ADMIN_PASSWORD": "mot-de-passe-admin"}
+
+
 def secured_sample() -> Project:
     p = Project.sample()
     p.api_key_enabled, p.api_key = True, KEY
+    return p
+
+
+def users_sample(api_key: bool = False) -> Project:
+    p = Project.sample()
+    p.users_enabled, p.open_registration = True, True
+    p.api_key_enabled, p.api_key = api_key, KEY
+    p.resources.append(Resource("note", [Field("body", "str")], access="owner"))
+    p.resources.append(Resource("tag", [Field("label", "str")], access="readonly"))
     return p
 
 
@@ -105,7 +118,8 @@ class GeneratorTests(unittest.TestCase):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "system"]
         self.assertEqual(calls, [])
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
-        self.assertTrue(imported <= {"os", "secrets", "sqlite3", "uvicorn", "datetime", "json", "logging", "time"})
+        self.assertTrue(imported <= {"os", "secrets", "sqlite3", "uvicorn", "datetime", "json", "logging", "time",
+                                     "threading", "anyio", "base64", "hashlib", "re", "jwt", "redis.asyncio"})
 
     def test_hardening_present(self):
         code = generate_main(secured_sample())
@@ -114,6 +128,29 @@ class GeneratorTests(unittest.TestCase):
                        "allow_credentials=False", "journal_mode=WAL", "server_header=False"):
             self.assertIn(marker, code)
         self.assertNotIn("Contrainte violée : {exc}", code)  # plus de fuite du message SQLite brut
+
+    def test_users_mode_generation(self):
+        for api_key in (False, True):
+            p = users_sample(api_key)
+            files = generate_files(p)
+            ast.parse(files["main.py"])
+            code = files["main.py"]
+            for marker in ("hashlib.scrypt", "OAuth2PasswordBearer", "token_version", "_DUMMY_HASH",
+                           "owner_id", "require_admin", "bootstrap_admin", "SqliteCounter", "RedisCounter"):
+                self.assertIn(marker, code)
+            self.assertIn("pyjwt", files["requirements.txt"])
+            self.assertIn("JWT_SECRET", files[".env.example"])
+            self.assertNotIn(JWT, code)
+            routes = {(r.method, r.path) for r in iter_routes(p)}
+            self.assertIn(("POST", "/auth/token"), routes)
+
+    def test_reserved_paths(self):
+        p = users_sample()
+        p.resources.append(Resource("x", [Field("a")], path="/auth/x"))
+        p.endpoints.append(Endpoint(path="/health/deep"))
+        msgs = " ".join(i.message for i in validate(p))
+        self.assertIn("est réservé", msgs)
+        self.assertIn("chemin réservé", msgs)
 
     def test_export_writes_all_files(self):
         expected = {"main.py", "requirements.txt", "Dockerfile", "README.md", ".env.example",
@@ -203,6 +240,85 @@ class GeneratedApiTests(unittest.TestCase):
         with self.load(Project.sample(), DOCS_ENABLED="0") as c:
             self.assertEqual(c.get("/docs").status_code, 404)
             self.assertEqual(c.get("/openapi.json").status_code, 404)
+
+    def login(self, c, email, password):
+        r = c.post("/auth/token", data={"username": email, "password": password})
+        self.assertEqual(r.status_code, 200, r.text)
+        return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    def test_users_and_ownership(self):
+        with self.load(users_sample(), JWT_SECRET=JWT, **ADMIN) as c:
+            # public : lecture anonyme, écriture admin
+            self.assertEqual(c.get("/products").status_code, 200)
+            self.assertEqual(c.post("/products", json={"title": "A", "price": 1}).status_code, 401)
+            self.assertEqual(c.get("/notes").status_code, 401)
+
+            for email in ("alice@exemple.fr", "bob@exemple.fr"):
+                self.assertEqual(c.post("/auth/register", json={"email": email, "password": "x" * 12}).status_code, 201)
+            self.assertEqual(c.post("/auth/register", json={"email": "ALICE@exemple.fr", "password": "x" * 12}).status_code, 409)
+            self.assertEqual(c.post("/auth/register", json={"email": "c@exemple.fr", "password": "court"}).status_code, 422)
+            alice = self.login(c, "alice@exemple.fr", "x" * 12)
+            bob = self.login(c, "bob@exemple.fr", "x" * 12)
+            admin = self.login(c, ADMIN["ADMIN_EMAIL"], ADMIN["ADMIN_PASSWORD"])
+            self.assertEqual(c.get("/auth/me", headers=admin).json()["role"], "admin")
+
+            # privé : chacun ses données, 404 pour celles des autres, l'admin voit tout
+            note = c.post("/notes", json={"body": "secret"}, headers=alice).json()
+            self.assertEqual(c.post("/notes", json={"body": "x", "owner_id": 99}, headers=alice).status_code, 422)
+            self.assertEqual(c.get("/notes", headers=bob).json(), [])
+            self.assertEqual(c.get(f"/notes/{note['id']}", headers=bob).status_code, 404)
+            self.assertEqual(c.patch(f"/notes/{note['id']}", json={"body": "pirate"}, headers=bob).status_code, 404)
+            self.assertEqual(c.delete(f"/notes/{note['id']}", headers=bob).status_code, 404)
+            self.assertEqual(len(c.get("/notes", headers=alice).json()), 1)
+            self.assertEqual(len(c.get("/notes", headers=admin).json()), 1)
+
+            # lecture seule : lecture connectée, écriture admin
+            self.assertEqual(c.post("/tags", json={"label": "x"}, headers=alice).status_code, 403)
+            self.assertEqual(c.post("/tags", json={"label": "x"}, headers=admin).status_code, 201)
+            self.assertEqual(c.get("/tags", headers=bob).status_code, 200)
+
+            # mauvais identifiants : même réponse que l'e-mail existe ou non
+            bad = c.post("/auth/token", data={"username": "alice@exemple.fr", "password": "y" * 12})
+            unknown = c.post("/auth/token", data={"username": "nobody@exemple.fr", "password": "y" * 12})
+            self.assertEqual((bad.status_code, bad.json()), (unknown.status_code, unknown.json()))
+
+            # changement de mot de passe : les anciens jetons sont révoqués
+            r = c.post("/auth/password", json={"current_password": "x" * 12, "new_password": "z" * 12}, headers=alice)
+            self.assertEqual(r.status_code, 204)
+            self.assertEqual(c.get("/auth/me", headers=alice).status_code, 401)
+            self.login(c, "alice@exemple.fr", "z" * 12)
+
+            # jeton falsifié ou signé avec un autre secret
+            import jwt as pyjwt
+            forged = pyjwt.encode({"sub": "1", "ver": 0, "iss": "boutique-api", "iat": 0, "exp": 2 ** 40,
+                                   "typ": "access"}, "autre-secret-" * 4, algorithm="HS256")
+            self.assertEqual(c.get("/auth/me", headers={"Authorization": f"Bearer {forged}"}).status_code, 401)
+            none_alg = pyjwt.encode({"sub": "1"}, None, algorithm="none")
+            self.assertEqual(c.get("/auth/me", headers={"Authorization": f"Bearer {none_alg}"}).status_code, 401)
+
+    def test_users_require_secret_and_closed_registration(self):
+        with self.assertRaises(RuntimeError):
+            self.load(users_sample(), JWT_SECRET="trop-court")
+        p = users_sample()
+        p.open_registration = False
+        with self.load(p, JWT_SECRET=JWT) as c:
+            self.assertEqual(c.post("/auth/register", json={"email": "a@b.fr", "password": "x" * 12}).status_code, 403)
+
+    def test_rate_limit_shared_between_workers(self):
+        """Deux applications (= deux workers) sur la même base partagent le compteur."""
+        tmp = tempfile.mkdtemp()
+        env = {"APIFORGE_DB": str(Path(tmp) / "shared.db"), "RATE_LIMIT_PER_MINUTE": "4"}
+        with self.load(Project.sample(), **env) as w1, self.load(Project.sample(), **env) as w2:
+            codes = [w.get("/products").status_code for w in (w1, w2, w1, w2, w1)]
+            self.assertEqual(codes[:4], [200] * 4)
+            self.assertEqual(codes[4], 429)
+
+    def test_auth_routes_stricter_limit(self):
+        with self.load(users_sample(), JWT_SECRET=JWT, AUTH_RATE_LIMIT_PER_MINUTE="3") as c:
+            codes = [c.post("/auth/token", data={"username": "a@b.fr", "password": "x" * 12}).status_code
+                     for _ in range(4)]
+            self.assertEqual(codes, [401, 401, 401, 429])
+            self.assertEqual(c.get("/products").status_code, 200)  # le reste de l'API n'est pas affecté
 
     def test_api_key(self):
         with self.assertRaises(RuntimeError):

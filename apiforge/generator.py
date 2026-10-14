@@ -1,15 +1,15 @@
 """Génération d'un projet FastAPI autonome à partir d'un `Project`.
 
-Le code produit ne dépend que de FastAPI, Pydantic v2 et de sqlite3 (stdlib).
+Le code produit dépend de FastAPI, Pydantic v2 et sqlite3 (stdlib), plus PyJWT et
+python-multipart quand les comptes utilisateurs sont activés.
 Toutes les chaînes utilisateur sont émises via `repr()` et tous les noms ont été
 validés en amont : aucune donnée saisie n'est interpolée telle quelle dans le code.
 
-Durcissement du code généré (voir SECURITY.md exporté) :
-- aucun secret dans le source : clés API lues dans l'environnement, refus de démarrer sans
-- schémas stricts (extra="forbid"), bornes de taille/valeur, PATCH sans null sur champs requis
-- en-têtes de sécurité, limite de taille de corps, limitation de débit par IP
-- erreurs SQL traduites sans fuite de schéma, LIKE échappé, SQLite en WAL
-- docs désactivables, hôtes autorisés, conteneur non-root avec healthcheck
+Durcissement (détaillé dans le SECURITY.md exporté) :
+- aucun secret dans le source : clés API et secret JWT lus dans l'environnement, refus de démarrer sans
+- comptes utilisateurs : mots de passe scrypt, JWT HS256 révocables, contrôle d'accès par ressource
+- schémas stricts, bornes de taille/valeur, erreurs SQL non divulguées, LIKE échappé
+- en-têtes de sécurité, limite de corps, limitation de débit partagée (SQLite ou Redis)
 """
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ from pathlib import Path
 
 from .model import FIELD_TYPES, Endpoint, Issue, Project, Resource, coerce_default, parse_response, validate
 
-GENERATOR_VERSION = "1.1"
+GENERATOR_VERSION = "1.2"
 SQLITE_INT_MAX = 2 ** 63 - 1
 SQLITE_INT_MIN = -(2 ** 63)
+OWNER_DDL = 'INTEGER REFERENCES "users"(id) ON DELETE CASCADE'
 
 
 class GenerationError(Exception):
@@ -36,6 +37,10 @@ class Route:
     method: str
     path: str
     summary: str
+
+
+def is_owned(p: Project, r: Resource) -> bool:
+    return p.users_enabled and r.access == "owner"
 
 
 # ── Bloc runtime émis tel quel (chaîne brute : c'est le source exact du fichier généré) ──
@@ -53,6 +58,13 @@ def _env_int(name: str, default: int) -> int:
         raise RuntimeError(f"Variable d'environnement {name} invalide : entier attendu") from None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "oui")
+
+
 def _env_list(name: str, default: str = "") -> list:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
@@ -60,14 +72,23 @@ def _env_list(name: str, default: str = "") -> list:
 DB_PATH = os.environ.get("APIFORGE_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db"))
 MAX_BODY_BYTES = _env_int("MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)
 RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", DEFAULT_RATE_LIMIT)
-DOCS_ENABLED = os.environ.get("DOCS_ENABLED", DEFAULT_DOCS).strip().lower() in ("1", "true", "yes", "oui")
+AUTH_RATE_LIMIT_PER_MINUTE = _env_int("AUTH_RATE_LIMIT_PER_MINUTE", 10)
+RATE_LIMIT_BACKEND = os.environ.get("RATE_LIMIT_BACKEND", "sqlite").strip().lower()
+REDIS_URL = os.environ.get("REDIS_URL", "")
+DOCS_ENABLED = _env_bool("DOCS_ENABLED", DEFAULT_DOCS)
 ALLOWED_HOSTS = _env_list("ALLOWED_HOSTS")
 CORS_ORIGINS = _env_list("CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
-HSTS_ENABLED = os.environ.get("HSTS", "").strip().lower() in ("1", "true", "yes", "oui")
+HSTS_ENABLED = _env_bool("HSTS", False)
 DOC_PATHS = {"/docs", "/redoc", "/docs/oauth2-redirect"}
+AUTH_PATHS = {"/auth/token", "/auth/register", "/auth/password"}
+
+if RATE_LIMIT_BACKEND not in ("sqlite", "redis", "memory"):
+    raise RuntimeError("RATE_LIMIT_BACKEND doit valoir sqlite, redis ou memory")
+if RATE_LIMIT_BACKEND == "redis" and not REDIS_URL:
+    raise RuntimeError("RATE_LIMIT_BACKEND=redis exige REDIS_URL (ex. redis://redis:6379/0)")
 
 
-# ── Middlewares ASGI (purs : compatibles streaming, sans dépendance) ─────────
+# ── Middlewares ASGI (purs : compatibles streaming) ──────────────────────────
 async def _send_json(send, status_code: int, detail: str, extra_headers=()) -> None:
     body = json.dumps({"detail": detail}, ensure_ascii=False).encode("utf-8")
     await send({
@@ -154,28 +175,112 @@ class BodySizeLimitMiddleware:
         await self.app(scope, limited_receive, send)
 
 
-class RateLimitMiddleware:
-    """Fenêtre fixe d'une minute par IP cliente (mémoire du process : un compteur par worker)."""
+class MemoryCounter:
+    """Compteur local au process : uniquement pour le développement avec un seul worker."""
 
-    def __init__(self, app, per_minute: int):
-        self.app = app
-        self.per_minute = per_minute
+    def __init__(self):
         self._hits: dict = {}
 
+    async def hit(self, bucket: str, win: int) -> int:
+        start, count = self._hits.get(bucket, (win, 0))
+        count = count + 1 if start == win else 1
+        self._hits[bucket] = (win, count)
+        if len(self._hits) > 50_000:
+            self._hits = {k: v for k, v in self._hits.items() if v[0] == win}
+        return count
+
+
+class SqliteCounter:
+    """Compteur partagé par tous les workers d'une même machine (même fichier SQLite)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._local = threading.local()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _rate_limit (bucket TEXT NOT NULL, win INTEGER NOT NULL, "
+                "hits INTEGER NOT NULL, PRIMARY KEY (bucket, win)) WITHOUT ROWID"
+            )
+            self._local.conn = conn
+        return conn
+
+    def _hit_sync(self, bucket: str, win: int) -> int:
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")  # sérialise les workers : incrément atomique
+        try:
+            conn.execute(
+                "INSERT INTO _rate_limit (bucket, win, hits) VALUES (?, ?, 1) "
+                "ON CONFLICT(bucket, win) DO UPDATE SET hits = hits + 1",
+                (bucket, win),
+            )
+            hits = conn.execute("SELECT hits FROM _rate_limit WHERE bucket = ? AND win = ?", (bucket, win)).fetchone()[0]
+            if hits == 1 and win % 5 == 0:
+                conn.execute("DELETE FROM _rate_limit WHERE win < ?", (win - 1,))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return hits
+
+    async def hit(self, bucket: str, win: int) -> int:
+        return await anyio.to_thread.run_sync(self._hit_sync, bucket, win)
+
+
+class RedisCounter:
+    """Compteur partagé entre plusieurs machines/instances."""
+
+    def __init__(self, url: str):
+        try:
+            import redis.asyncio as aioredis
+        except ImportError:
+            raise RuntimeError("RATE_LIMIT_BACKEND=redis nécessite le paquet « redis » (pip install redis)") from None
+        self._redis = aioredis.from_url(url)
+
+    async def hit(self, bucket: str, win: int) -> int:
+        key = f"ratelimit:{bucket}:{win}"
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.incr(key)
+            pipe.expire(key, 120)
+            hits, _ = await pipe.execute()
+        return int(hits)
+
+
+def _make_counter():
+    if RATE_LIMIT_BACKEND == "redis":
+        return RedisCounter(REDIS_URL)
+    if RATE_LIMIT_BACKEND == "memory":
+        return MemoryCounter()
+    return SqliteCounter(DB_PATH)
+
+
+class RateLimitMiddleware:
+    """Fenêtre fixe d'une minute par IP ; limite plus stricte sur les routes d'authentification."""
+
+    def __init__(self, app, per_minute: int, auth_per_minute: int):
+        self.app = app
+        self.per_minute = per_minute
+        self.auth_per_minute = auth_per_minute
+        self.counter = _make_counter() if (per_minute > 0 or auth_per_minute > 0) else None
+
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or self.per_minute <= 0 or scope["path"] == "/health":
+        if scope["type"] != "http" or self.counter is None or scope["path"] == "/health":
+            return await self.app(scope, receive, send)
+        is_auth = scope["method"] == "POST" and scope["path"] in AUTH_PATHS
+        limit = self.auth_per_minute if is_auth else self.per_minute
+        if limit <= 0:
             return await self.app(scope, receive, send)
         now = time.time()
-        window = int(now // 60)
         client = (scope.get("client") or ("inconnu", 0))[0]
-        start, count = self._hits.get(client, (window, 0))
-        if start != window:
-            start, count = window, 0
-        count += 1
-        self._hits[client] = (start, count)
-        if len(self._hits) > 50_000:  # borne mémoire : on purge les fenêtres expirées
-            self._hits = {k: v for k, v in self._hits.items() if v[0] == window}
-        if count > self.per_minute:
+        try:
+            hits = await self.counter.hit(("auth:" if is_auth else "api:") + client, int(now // 60))
+        except Exception:  # disponibilité d'abord : un compteur en panne ne coupe pas l'API
+            log.exception("Limiteur de débit indisponible, requête laissée passer")
+            hits = 0
+        if hits > limit:
             retry_after = str(60 - int(now % 60)).encode()
             return await _send_json(send, 429, "Trop de requêtes, réessaie plus tard",
                                     [(b"retry-after", retry_after)])
@@ -192,18 +297,21 @@ def init_db() -> None:
     """Crée les tables, active WAL et ajoute les colonnes manquantes (migration légère)."""
     with sqlite3.connect(DB_PATH, timeout=10) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
-        for table, (ddl, columns) in SCHEMA.items():
+        for table, (ddl, columns, extra) in SCHEMA.items():
             conn.execute(ddl)
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({_q(table)})")}
             for column, sql_type in columns:
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {_q(table)} ADD COLUMN {_q(column)} {sql_type}")
                     log.info("Colonne ajoutée : %s.%s", table, column)
+            for statement in extra:
+                conn.execute(statement)
 
 
 def get_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -226,9 +334,15 @@ def _integrity_error(exc: sqlite3.IntegrityError) -> HTTPException:
     return HTTPException(status.HTTP_409_CONFLICT, "Conflit de données")
 
 
-def _fetch_one(db: sqlite3.Connection, table: str, item_id: int) -> dict:
-    row = db.execute(f"SELECT * FROM {_q(table)} WHERE id = ?", (item_id,)).fetchone()
-    if row is None:
+def _scope(owner: Optional[int]) -> tuple:
+    """Filtre propriétaire : None = pas de filtre (admin ou ressource non privée)."""
+    return ("", []) if owner is None else (" AND owner_id = ?", [owner])
+
+
+def _fetch_one(db: sqlite3.Connection, table: str, item_id: int, owner: Optional[int] = None) -> dict:
+    clause, params = _scope(owner)
+    row = db.execute(f"SELECT * FROM {_q(table)} WHERE id = ?{clause}", [item_id, *params]).fetchone()
+    if row is None:  # même réponse qu'une ligne inexistante : pas de fuite d'existence
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"{table} #{item_id} introuvable")
     return dict(row)
 
@@ -238,11 +352,15 @@ def _like_pattern(term: str) -> str:
     return f"%{escaped}%"
 
 
-def _list_rows(db, table, columns, text_columns, limit, offset, q, sort):
-    where, params = "", []
+def _list_rows(db, table, columns, text_columns, limit, offset, q, sort, owner=None):
+    conditions, params = [], []
+    if owner is not None:
+        conditions.append("owner_id = ?")
+        params.append(owner)
     if q and text_columns:
-        where = " WHERE " + " OR ".join(f"{_q(c)} LIKE ? ESCAPE '\\'" for c in text_columns)
-        params = [_like_pattern(q)] * len(text_columns)
+        conditions.append("(" + " OR ".join(f"{_q(c)} LIKE ? ESCAPE '\\'" for c in text_columns) + ")")
+        params.extend([_like_pattern(q)] * len(text_columns))
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     total = db.execute(f"SELECT COUNT(*) FROM {_q(table)}{where}", params).fetchone()[0]
     order, direction = "id", "ASC"
     if sort:
@@ -268,8 +386,8 @@ def _insert(db: sqlite3.Connection, table: str, data: dict) -> dict:
     return _fetch_one(db, table, cur.lastrowid)
 
 
-def _update(db: sqlite3.Connection, table: str, item_id: int, data: dict) -> dict:
-    _fetch_one(db, table, item_id)
+def _update(db: sqlite3.Connection, table: str, item_id: int, data: dict, owner: Optional[int] = None) -> dict:
+    _fetch_one(db, table, item_id, owner)
     if data:
         assignments = ", ".join(f"{_q(c)} = ?" for c in data)
         try:
@@ -279,8 +397,8 @@ def _update(db: sqlite3.Connection, table: str, item_id: int, data: dict) -> dic
     return _fetch_one(db, table, item_id)
 
 
-def _delete(db: sqlite3.Connection, table: str, item_id: int) -> None:
-    _fetch_one(db, table, item_id)
+def _delete(db: sqlite3.Connection, table: str, item_id: int, owner: Optional[int] = None) -> None:
+    _fetch_one(db, table, item_id, owner)
     db.execute(f"DELETE FROM {_q(table)} WHERE id = ?", (item_id,))
 
 
@@ -298,10 +416,21 @@ def _render(value, params: dict):
 
 
 ItemId = Annotated[int, PathParam(ge=1, le=SQLITE_INT_MAX, description="Identifiant")]
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Identité de l'appelant. user_id=None : service (clé API) ou API sans authentification."""
+
+    user_id: Optional[int]
+    is_admin: bool
+
+    def owner_filter(self) -> Optional[int]:
+        return None if self.is_admin else self.user_id
 '''
 
-AUTH = r'''
-# ── Authentification par clé API ─────────────────────────────────────────────
+API_KEY_BLOCK = r'''
+# ── Clés API (accès service, droits administrateur) ──────────────────────────
 # Aucune clé n'est écrite dans ce fichier : API_KEYS (liste séparée par des virgules,
 # pour permettre la rotation) ou API_KEY doivent être définies dans l'environnement.
 API_KEYS = [k.encode("utf-8") for k in _env_list("API_KEYS", os.environ.get("API_KEY", ""))]
@@ -309,19 +438,224 @@ if not API_KEYS:
     raise RuntimeError("Aucune clé API configurée : définis API_KEYS (ou API_KEY) dans l'environnement.")
 if any(len(k) < 16 for k in API_KEYS):
     raise RuntimeError("Chaque clé API doit faire au moins 16 caractères.")
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="Clé d'accès à l'API")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="Clé d'accès service")
 
 
-def require_api_key(key: Optional[str] = Security(_api_key_header)) -> None:
-    candidate = (key or "").encode("utf-8")
+def _valid_api_key(key: str) -> bool:
+    candidate = key.encode("utf-8")
     # compare_digest sur chaque clé : temps constant, pas de court-circuit révélateur
-    valid = [secrets.compare_digest(candidate, k) for k in API_KEYS]
-    if not key or not any(valid):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Clé API invalide ou absente")
-
-
-SECURED = [Depends(require_api_key)]
+    return any([secrets.compare_digest(candidate, k) for k in API_KEYS])
 '''
+
+USERS_BLOCK = r'''
+# ── Comptes utilisateurs & JWT ───────────────────────────────────────────────
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET doit être défini dans l'environnement (32 caractères minimum).")
+JWT_ALGORITHM = "HS256"
+JWT_ISSUER = __ISSUER__
+JWT_TTL_MINUTES = _env_int("JWT_TTL_MINUTES", __TTL__)
+OPEN_REGISTRATION = _env_bool("OPEN_REGISTRATION", __OPEN__)
+PASSWORD_MIN, PASSWORD_MAX = 12, 128
+EMAIL_PATTERN = r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$"
+_SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1}
+_oauth2 = OAuth2PasswordBearer(tokenUrl="auth/token", auto_error=False)
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, dklen=32, **_SCRYPT)
+    return "scrypt${n}${r}${p}$".format(**_SCRYPT) + base64.b64encode(salt).decode() + "$" + base64.b64encode(digest).decode()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        _, n, r, p, salt, digest = stored.split("$")
+        expected = base64.b64decode(digest)
+        actual = hashlib.scrypt(password.encode("utf-8"), salt=base64.b64decode(salt),
+                                n=int(n), r=int(r), p=int(p), dklen=len(expected))
+    except (ValueError, TypeError):
+        return False
+    return secrets.compare_digest(actual, expected)
+
+
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(16))  # égalise le temps de réponse si l'e-mail est inconnu
+
+
+class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    email: str = Field(..., max_length=254, pattern=EMAIL_PATTERN)
+    password: str = Field(..., min_length=PASSWORD_MIN, max_length=PASSWORD_MAX)
+
+
+class PasswordChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(..., max_length=PASSWORD_MAX)
+    new_password: str = Field(..., min_length=PASSWORD_MIN, max_length=PASSWORD_MAX)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: int
+    email: str
+    role: str
+    created_at: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+def _create_user(db: sqlite3.Connection, email: str, password: str, role: str = "user") -> dict:
+    try:
+        cur = db.execute(
+            'INSERT INTO "users" (email, password_hash, role, created_at) VALUES (?, ?, ?, ?)',
+            (email.lower(), hash_password(password), role, _dt.datetime.now(_dt.timezone.utc).isoformat()),
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Un compte existe déjà avec cet e-mail") from None
+    return dict(db.execute('SELECT * FROM "users" WHERE id = ?', (cur.lastrowid,)).fetchone())
+
+
+def _issue_token(user) -> Token:
+    now = int(time.time())
+    payload = {"sub": str(user["id"]), "ver": user["token_version"], "iss": JWT_ISSUER,
+               "iat": now, "exp": now + JWT_TTL_MINUTES * 60, "typ": "access"}
+    return Token(access_token=jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM),
+                 expires_in=JWT_TTL_MINUTES * 60)
+
+
+_INVALID_TOKEN = HTTPException(status.HTTP_401_UNAUTHORIZED, "Jeton invalide ou expiré",
+                               headers={"WWW-Authenticate": "Bearer"})
+
+
+def _user_from_token(db: sqlite3.Connection, token: str) -> dict:
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], issuer=JWT_ISSUER,
+                            options={"require": ["exp", "iat", "sub", "iss"]})
+        user_id = int(claims["sub"])
+    except (jwt.PyJWTError, ValueError, TypeError):
+        raise _INVALID_TOKEN from None
+    if claims.get("typ") != "access":
+        raise _INVALID_TOKEN
+    row = db.execute('SELECT * FROM "users" WHERE id = ?', (user_id,)).fetchone()
+    # compte supprimé, désactivé, ou jetons révoqués (changement de mot de passe) : refus
+    if row is None or not row["is_active"] or row["token_version"] != claims.get("ver"):
+        raise _INVALID_TOKEN
+    return dict(row)
+
+
+def current_user(token: Optional[str] = Security(_oauth2), db: sqlite3.Connection = Depends(get_db)) -> dict:
+    if not token:
+        raise _INVALID_TOKEN
+    return _user_from_token(db, token)
+
+
+def bootstrap_admin() -> None:
+    """Crée le compte administrateur initial depuis ADMIN_EMAIL / ADMIN_PASSWORD s'il n'existe pas."""
+    email, password = os.environ.get("ADMIN_EMAIL", "").strip().lower(), os.environ.get("ADMIN_PASSWORD", "")
+    if not email:
+        return
+    if not PASSWORD_MIN <= len(password) <= PASSWORD_MAX or not re.match(EMAIL_PATTERN, email):
+        raise RuntimeError(f"ADMIN_EMAIL invalide ou ADMIN_PASSWORD hors {PASSWORD_MIN}-{PASSWORD_MAX} caractères")
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        if conn.execute('SELECT 1 FROM "users" WHERE email = ?', (email,)).fetchone() is None:
+            _create_user(conn, email, password, "admin")
+            log.info("Compte administrateur créé : %s", email)
+
+
+router_auth = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router_auth.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED, summary="Créer un compte")
+def register(payload: UserCreate, db: sqlite3.Connection = Depends(get_db)):
+    if not OPEN_REGISTRATION:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Les inscriptions sont fermées")
+    return _create_user(db, payload.email, payload.password)
+
+
+@router_auth.post("/token", response_model=Token, summary="Se connecter (OAuth2 mot de passe)")
+def login(form: OAuth2PasswordRequestForm = Depends(), db: sqlite3.Connection = Depends(get_db)):
+    email, password = form.username.strip().lower()[:254], form.password
+    row = db.execute('SELECT * FROM "users" WHERE email = ?', (email,)).fetchone()
+    # on vérifie toujours un hash (réel ou factice) : même durée que l'e-mail existe ou non
+    valid = len(password) <= PASSWORD_MAX and verify_password(password, row["password_hash"] if row else _DUMMY_HASH)
+    if row is None or not valid or not row["is_active"]:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Identifiants invalides", headers={"WWW-Authenticate": "Bearer"})
+    return _issue_token(row)
+
+
+@router_auth.get("/me", response_model=UserOut, summary="Mon compte")
+def me(user: dict = Depends(current_user)):
+    return user
+
+
+@router_auth.post("/password", status_code=status.HTTP_204_NO_CONTENT, summary="Changer de mot de passe")
+def change_password(payload: PasswordChange, user: dict = Depends(current_user),
+                    db: sqlite3.Connection = Depends(get_db)):
+    if not verify_password(payload.current_password, user["password_hash"]):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Mot de passe actuel incorrect")
+    db.execute('UPDATE "users" SET password_hash = ?, token_version = token_version + 1 WHERE id = ?',
+               (hash_password(payload.new_password), user["id"]))  # révoque tous les jetons émis
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+'''
+
+USERS_DDL = (
+    'CREATE TABLE IF NOT EXISTS "users" (id INTEGER PRIMARY KEY AUTOINCREMENT, '
+    "email TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, "
+    "role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')), "
+    "is_active INTEGER NOT NULL DEFAULT 1, token_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"
+)
+
+
+def _principal_block(p: Project) -> str:
+    """Dépendance unique d'identification, selon les mécanismes activés."""
+    key, users = p.api_key_enabled, p.users_enabled
+    L = ["", "# ── Identification de l'appelant " + "─" * 41]
+    if not key and not users:
+        L += [
+            "def get_principal() -> Principal:",
+            '    """Aucune authentification configurée : tout appelant a tous les droits."""',
+            "    return Principal(None, True)",
+        ]
+    else:
+        params = []
+        if key:
+            params.append("    api_key: Optional[str] = Security(_api_key_header),")
+        if users:
+            params.append("    token: Optional[str] = Security(_oauth2),")
+            params.append("    db: sqlite3.Connection = Depends(get_db),")
+        L += ["def get_principal(", *params, ") -> Principal:"]
+        if key:
+            L += [
+                "    if api_key is not None:",
+                "        if not _valid_api_key(api_key):",
+                '            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Clé API invalide")',
+                "        return Principal(None, True)",
+            ]
+        if users:
+            L += [
+                "    if token:",
+                "        user = _user_from_token(db, token)",
+                '        return Principal(user["id"], user["role"] == "admin")',
+            ]
+        L += [
+            '    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentification requise",',
+            '                        headers={"WWW-Authenticate": "Bearer"})',
+        ]
+    L += [
+        "",
+        "",
+        "def require_admin(principal: Principal = Depends(get_principal)) -> Principal:",
+        "    if not principal.is_admin:",
+        '        raise HTTPException(status.HTTP_403_FORBIDDEN, "Droits administrateur requis")',
+        "    return principal",
+        "",
+    ]
+    return "\n".join(L)
 
 
 def _comment(text: str) -> str:
@@ -338,9 +672,16 @@ def _sql_column(field) -> str:
     return " ".join(parts)
 
 
-def _ddl(r: Resource) -> str:
+def _schema_entry(p: Project, r: Resource) -> str:
     cols = ["id INTEGER PRIMARY KEY AUTOINCREMENT", *(_sql_column(f) for f in r.fields)]
-    return f'CREATE TABLE IF NOT EXISTS "{r.name}" ({", ".join(cols)})'
+    columns = [(f.name, FIELD_TYPES[f.type][1]) for f in r.fields]
+    extra: list[str] = []
+    if is_owned(p, r):
+        cols.append(f'"owner_id" {OWNER_DDL}')
+        columns.append(("owner_id", OWNER_DDL))
+        extra.append(f'CREATE INDEX IF NOT EXISTS "ix_{r.name}_owner" ON "{r.name}" ("owner_id")')
+    ddl = f'CREATE TABLE IF NOT EXISTS "{r.name}" ({", ".join(cols)})'
+    return f"    {r.name!r}: ({ddl!r}, {columns!r}, {extra!r}),"
 
 
 def _default_literal(field) -> str | None:
@@ -354,7 +695,7 @@ def _default_literal(field) -> str | None:
     return repr(value)
 
 
-def _constraints(field, *, partial: bool) -> list[str]:
+def _constraints(field) -> list[str]:
     """Bornes Pydantic : taille du texte, plage SQLite des entiers, pas de NaN/Infini."""
     kw: list[str] = []
     if field.type == "str":
@@ -376,7 +717,7 @@ def _field_line(field, *, partial: bool) -> str:
     if partial or not field.required:
         annotation = f"Optional[{annotation}]"
         default = default or "None"
-    kw = _constraints(field, partial=partial)
+    kw = _constraints(field)
     if kw:
         return f"    {field.name}: {annotation} = Field({default if default is not None else '...'}, {', '.join(kw)})"
     if default is None:
@@ -387,15 +728,23 @@ def _field_line(field, *, partial: bool) -> str:
 STRICT = '    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)'
 
 
-def _resource_block(r: Resource) -> str:
+def _resource_block(p: Project, r: Resource) -> str:
     c, n = r.class_name, r.name
     up = n.upper()
     fields = r.fields
+    owned = is_owned(p, r)
     required = [f.name for f in fields if f.required]
     text_cols = tuple(f.name for f in fields if f.type == "str")
-    tag = repr(n)
+
+    # Dépendances d'accès selon le mode de la ressource
+    reader = "" if r.access == "public" else "principal: Principal = Depends(get_principal), "
+    writer_dep = "require_admin" if r.access in ("readonly", "public") else "get_principal"
+    writer = f"principal: Principal = Depends({writer_dep}), "
+    owner_arg = ", principal.owner_filter()" if owned else ""
+    owner_kw = ", owner=principal.owner_filter()" if owned else ""
+
     L: list[str] = [
-        f"# ── Ressource : {n} {'─' * max(0, 56 - len(n))}",
+        f"# ── Ressource : {n} ({r.access}) {'─' * max(0, 46 - len(n) - len(r.access))}",
         f"class {c}Base(BaseModel):",
         STRICT,
         *(_field_line(f, partial=False) for f in fields),
@@ -425,12 +774,13 @@ def _resource_block(r: Resource) -> str:
         f"class {c}Out({c}Base):",
         '    model_config = ConfigDict(extra="ignore")  # tolère les colonnes retirées du modèle',
         "    id: int",
+        *(["    owner_id: Optional[int] = None"] if owned else []),
         "",
         "",
         f"{up}_TABLE = {n!r}",
         f"{up}_COLUMNS = {tuple(f.name for f in fields)!r}",
         f"{up}_TEXT_COLUMNS = {text_cols!r}",
-        f"router_{n} = APIRouter(prefix={r.route_prefix!r}, tags=[{tag}])",
+        f"router_{n} = APIRouter(prefix={r.route_prefix!r}, tags=[{n!r}])",
         "",
     ]
     if r.ops.get("list"):
@@ -439,6 +789,7 @@ def _resource_block(r: Resource) -> str:
             f'@router_{n}.get("", response_model=list[{c}Out], summary={("Lister " + n)!r})',
             f"def list_{n}(",
             "    response: Response,",
+            *([f"    {reader.strip()}"] if reader else []),
             "    limit: int = Query(50, ge=1, le=500),",
             "    offset: int = Query(0, ge=0, le=1_000_000),",
             '    q: Optional[str] = Query(None, max_length=100, description="Recherche plein texte sur les champs texte"),',
@@ -446,7 +797,7 @@ def _resource_block(r: Resource) -> str:
             "                                description=\"Champ de tri, préfixé de '-' pour l'ordre décroissant\"),",
             "    db: sqlite3.Connection = Depends(get_db),",
             "):",
-            f"    rows, total = _list_rows(db, {up}_TABLE, {up}_COLUMNS, {up}_TEXT_COLUMNS, limit, offset, q, sort)",
+            f"    rows, total = _list_rows(db, {up}_TABLE, {up}_COLUMNS, {up}_TEXT_COLUMNS, limit, offset, q, sort{owner_kw})",
             '    response.headers["X-Total-Count"] = str(total)',
             "    return rows",
             "",
@@ -455,37 +806,40 @@ def _resource_block(r: Resource) -> str:
         L += [
             "",
             f'@router_{n}.get("/{{item_id}}", response_model={c}Out, summary={("Lire " + n)!r})',
-            f"def get_{n}(item_id: ItemId, db: sqlite3.Connection = Depends(get_db)):",
-            f"    return _fetch_one(db, {up}_TABLE, item_id)",
+            f"def get_{n}(item_id: ItemId, {reader}db: sqlite3.Connection = Depends(get_db)):",
+            f"    return _fetch_one(db, {up}_TABLE, item_id{owner_arg})",
             "",
         ]
     if r.ops.get("create"):
+        data = 'payload.model_dump(mode="json")'
+        if owned:
+            data = f'{{**{data}, "owner_id": principal.user_id}}'
         L += [
             "",
             f'@router_{n}.post("", response_model={c}Out, status_code=status.HTTP_201_CREATED, summary={("Créer " + n)!r})',
-            f"def create_{n}(payload: {c}Create, db: sqlite3.Connection = Depends(get_db)):",
-            f'    return _insert(db, {up}_TABLE, payload.model_dump(mode="json"))',
+            f"def create_{n}(payload: {c}Create, {writer}db: sqlite3.Connection = Depends(get_db)):",
+            f"    return _insert(db, {up}_TABLE, {data})",
             "",
         ]
     if r.ops.get("update"):
         L += [
             "",
             f'@router_{n}.put("/{{item_id}}", response_model={c}Out, summary={("Remplacer " + n)!r})',
-            f"def replace_{n}(item_id: ItemId, payload: {c}Create, db: sqlite3.Connection = Depends(get_db)):",
-            f'    return _update(db, {up}_TABLE, item_id, payload.model_dump(mode="json"))',
+            f"def replace_{n}(item_id: ItemId, payload: {c}Create, {writer}db: sqlite3.Connection = Depends(get_db)):",
+            f'    return _update(db, {up}_TABLE, item_id, payload.model_dump(mode="json"){owner_arg})',
             "",
             "",
             f'@router_{n}.patch("/{{item_id}}", response_model={c}Out, summary={("Modifier partiellement " + n)!r})',
-            f"def patch_{n}(item_id: ItemId, payload: {c}Update, db: sqlite3.Connection = Depends(get_db)):",
-            f'    return _update(db, {up}_TABLE, item_id, payload.model_dump(mode="json", exclude_unset=True))',
+            f"def patch_{n}(item_id: ItemId, payload: {c}Update, {writer}db: sqlite3.Connection = Depends(get_db)):",
+            f'    return _update(db, {up}_TABLE, item_id, payload.model_dump(mode="json", exclude_unset=True){owner_arg})',
             "",
         ]
     if r.ops.get("delete"):
         L += [
             "",
             f'@router_{n}.delete("/{{item_id}}", status_code=status.HTTP_204_NO_CONTENT, summary={("Supprimer " + n)!r})',
-            f"def delete_{n}(item_id: ItemId, db: sqlite3.Connection = Depends(get_db)):",
-            f"    _delete(db, {up}_TABLE, item_id)",
+            f"def delete_{n}(item_id: ItemId, {writer}db: sqlite3.Connection = Depends(get_db)):",
+            f"    _delete(db, {up}_TABLE, item_id{owner_arg})",
             "    return Response(status_code=status.HTTP_204_NO_CONTENT)",
             "",
         ]
@@ -514,6 +868,8 @@ def _endpoint_block(i: int, e: Endpoint) -> str:
 
 def _used_methods(p: Project) -> list[str]:
     methods = {"GET", "OPTIONS"}
+    if p.users_enabled:
+        methods.add("POST")
     for r in p.resources:
         if r.ops.get("create"):
             methods.add("POST")
@@ -525,12 +881,50 @@ def _used_methods(p: Project) -> list[str]:
     return sorted(methods)
 
 
+def _allowed_headers(p: Project) -> list[str]:
+    headers = ["Content-Type"]
+    if p.api_key_enabled:
+        headers.append("X-API-Key")
+    if p.users_enabled:
+        headers.append("Authorization")
+    return headers
+
+
 def generate_main(p: Project) -> str:
     issues = validate(p)
     if issues:
         raise GenerationError(issues)
 
     title = _comment(p.name).replace("\\", "/").replace('"', "'")
+    imports = [
+        "import base64" if p.users_enabled else None,
+        "import datetime as _dt",
+        "import hashlib" if p.users_enabled else None,
+        "import json",
+        "import logging",
+        "import os",
+        "import re" if p.users_enabled else None,
+        "import secrets",
+        "import sqlite3",
+        "import threading",
+        "import time",
+        "from contextlib import asynccontextmanager",
+        "from dataclasses import dataclass",
+        "from typing import Annotated, Iterator, Optional",
+        "",
+        "import anyio",
+        "import jwt" if p.users_enabled else None,
+        "from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response, Security, status",
+        "from fastapi import Path as PathParam",
+        "from fastapi.middleware.cors import CORSMiddleware",
+        "from fastapi.middleware.trustedhost import TrustedHostMiddleware",
+        "from fastapi.security import APIKeyHeader" if p.api_key_enabled else None,
+        "from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm" if p.users_enabled else None,
+        "from pydantic import BaseModel, ConfigDict, Field, field_validator",
+    ]
+    schema = [f"    'users': ({USERS_DDL!r}, [], []),"] if p.users_enabled else []
+    schema += [_schema_entry(p, r) for r in p.resources]
+
     out: list[str] = [
         f'"""{title} — API générée par APIForge {GENERATOR_VERSION}.',
         "",
@@ -538,45 +932,34 @@ def generate_main(p: Project) -> str:
         "Docs   :  http://127.0.0.1:%d/docs  (DOCS_ENABLED=0 pour les masquer)" % int(p.port),
         "Config :  variables d'environnement, voir .env.example et SECURITY.md",
         '"""',
-        "import datetime as _dt",
-        "import json",
-        "import logging",
-        "import os",
-        "import secrets",
-        "import sqlite3",
-        "import time",
-        "from contextlib import asynccontextmanager",
-        "from typing import Annotated, Iterator, Optional",
-        "",
-        "from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response, Security, status",
-        "from fastapi import Path as PathParam",
-        "from fastapi.middleware.cors import CORSMiddleware",
-        "from fastapi.middleware.trustedhost import TrustedHostMiddleware",
-        "from fastapi.security import APIKeyHeader",
-        "from pydantic import BaseModel, ConfigDict, Field, field_validator",
+        *(line for line in imports if line is not None),
         "",
         f"SQLITE_INT_MAX = {SQLITE_INT_MAX}",
         f"DEFAULT_MAX_BODY_BYTES = {int(p.max_body_kb) * 1024}",
         f"DEFAULT_RATE_LIMIT = {int(p.rate_limit)}",
-        f"DEFAULT_DOCS = {('1' if p.docs_enabled else '0')!r}",
+        f"DEFAULT_DOCS = {bool(p.docs_enabled)!r}",
         f"DEFAULT_CORS_ORIGINS = {(p.cors_origins.strip() if p.cors else '')!r}",
         "",
+        "# table -> (DDL, colonnes pour la migration, instructions complémentaires)",
         "SCHEMA: dict = {",
-        *(f"    {r.name!r}: ({_ddl(r)!r}, {[(f.name, FIELD_TYPES[f.type][1]) for f in r.fields]!r})," for r in p.resources),
+        *schema,
         "}",
         RUNTIME,
     ]
     if p.api_key_enabled:
-        out.append(AUTH)
-    else:
-        out.append("\nSECURED: list = []  # authentification par clé API désactivée dans APIForge\n")
+        out.append(API_KEY_BLOCK)
+    if p.users_enabled:
+        out.append(USERS_BLOCK.replace("__ISSUER__", repr(p.slug))
+                   .replace("__TTL__", str(int(p.jwt_ttl_minutes)))
+                   .replace("__OPEN__", repr(bool(p.open_registration))))
+    out.append(_principal_block(p))
 
     for r in p.resources:
-        out.append("\n" + _resource_block(r))
+        out.append("\n" + _resource_block(p, r))
 
     if p.endpoints:
         out.append("\n# ── Endpoints personnalisés " + "─" * 46)
-        out.append("router_custom = APIRouter()")
+        out.append("router_custom = APIRouter(dependencies=[Depends(get_principal)])")
         for i, e in enumerate(p.endpoints):
             out.append(_endpoint_block(i, e))
 
@@ -586,9 +969,11 @@ def generate_main(p: Project) -> str:
         "@asynccontextmanager",
         "async def lifespan(_app: FastAPI):",
         "    init_db()",
+        *(["    bootstrap_admin()"] if p.users_enabled else []),
         "    log.info(",
-        '        "Démarrage — docs=%s, débit=%s req/min/IP, corps max=%s o, hôtes=%s, CORS=%s",',
-        '        DOCS_ENABLED, RATE_LIMIT_PER_MINUTE or "illimité", MAX_BODY_BYTES, ALLOWED_HOSTS or "tous", CORS_ORIGINS or "aucun",',
+        '        "Démarrage — docs=%s, débit=%s req/min/IP (%s), corps max=%s o, hôtes=%s, CORS=%s",',
+        '        DOCS_ENABLED, RATE_LIMIT_PER_MINUTE or "illimité", RATE_LIMIT_BACKEND, MAX_BODY_BYTES,',
+        '        ALLOWED_HOSTS or "tous", CORS_ORIGINS or "aucun",',
         "    )",
         "    yield",
         "",
@@ -605,16 +990,17 @@ def generate_main(p: Project) -> str:
         "",
         "# Ordre : le dernier ajouté est le plus externe.",
         "app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)",
-        "app.add_middleware(RateLimitMiddleware, per_minute=RATE_LIMIT_PER_MINUTE)",
+        "app.add_middleware(RateLimitMiddleware, per_minute=RATE_LIMIT_PER_MINUTE,",
+        "                   auth_per_minute=AUTH_RATE_LIMIT_PER_MINUTE)",
         "if ALLOWED_HOSTS:",
         "    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)",
         "if CORS_ORIGINS:",
         "    app.add_middleware(",
         "        CORSMiddleware,",
         "        allow_origins=CORS_ORIGINS,",
-        "        allow_credentials=False,",
+        "        allow_credentials=False,  # authentification par en-tête, jamais par cookie",
         f"        allow_methods={_used_methods(p)!r},",
-        f"        allow_headers={['Content-Type', 'X-API-Key'] if p.api_key_enabled else ['Content-Type']!r},",
+        f"        allow_headers={_allowed_headers(p)!r},",
         '        expose_headers=["X-Total-Count"],',
         "        max_age=600,",
         "    )",
@@ -627,9 +1013,11 @@ def generate_main(p: Project) -> str:
         "",
         "",
     ]
-    out += [f"app.include_router(router_{r.name}, dependencies=SECURED)" for r in p.resources]
+    if p.users_enabled:
+        out.append("app.include_router(router_auth)")
+    out += [f"app.include_router(router_{r.name})" for r in p.resources]
     if p.endpoints:
-        out.append("app.include_router(router_custom, dependencies=SECURED)")
+        out.append("app.include_router(router_custom)")
     out += [
         "",
         "",
@@ -649,50 +1037,122 @@ def generate_main(p: Project) -> str:
     return "\n".join(out)
 
 
+ACCESS_DOC = {
+    "owner": "privée : chaque utilisateur ne voit et ne modifie que ses lignes (404 sinon), les admins voient tout",
+    "shared": "partagée : tout utilisateur authentifié lit et écrit",
+    "readonly": "lecture pour les utilisateurs authentifiés, écriture réservée aux admins",
+    "public": "lecture anonyme, écriture réservée aux admins",
+}
+
+
 def _security_md(p: Project) -> str:
-    auth = (
-        "- **Clé API obligatoire** (en-tête `X-API-Key`) sur toutes les routes sauf `/health` et la documentation.\n"
-        "  Aucune clé n'est écrite dans le code : l'API **refuse de démarrer** sans `API_KEYS`.\n"
-        "  Plusieurs clés séparées par des virgules permettent une rotation sans coupure.\n"
-        if p.api_key_enabled else
-        "- ⚠️ **Aucune authentification** : n'expose pas cette API sur Internet sans en ajouter une.\n"
-    )
-    return (
-        "# Sécurité\n\n"
-        "## Mesures intégrées\n\n"
-        f"{auth}"
-        "- Schémas stricts : champs inconnus refusés (422), textes bornés en longueur, entiers bornés à 64 bits,\n"
-        "  décimaux sans NaN/Infini, champs requis non nullables en PATCH.\n"
-        "- SQL paramétré, identifiants validés à la génération, tri sur liste blanche, `LIKE` échappé.\n"
+    any_auth = p.api_key_enabled or p.users_enabled
+    lines = ["# Sécurité\n", "## Authentification\n"]
+    if p.users_enabled:
+        lines.append(
+            "- **Comptes utilisateurs** : `POST /auth/token` (formulaire OAuth2 `username`/`password`) renvoie un\n"
+            "  JWT HS256 à passer en `Authorization: Bearer …`. Mots de passe hachés en **scrypt** (sel aléatoire),\n"
+            "  12 à 128 caractères. Réponse identique et durée constante que l'e-mail existe ou non.\n"
+            "- Jetons signés avec `JWT_SECRET` (obligatoire, 32 caractères min.), émetteur vérifié, expiration\n"
+            f"  `JWT_TTL_MINUTES` ({p.jwt_ttl_minutes} min). `POST /auth/password` révoque tous les jetons existants ;\n"
+            "  un compte désactivé (`is_active = 0`) est refusé immédiatement.\n"
+            f"- Inscription libre via `POST /auth/register` : **{'ouverte' if p.open_registration else 'fermée'}** "
+            "(`OPEN_REGISTRATION`).\n"
+            "- Premier administrateur créé au démarrage depuis `ADMIN_EMAIL` / `ADMIN_PASSWORD`.\n"
+        )
+    if p.api_key_enabled:
+        lines.append(
+            "- **Clés API** (`X-API-Key`) : accès service avec droits administrateur. Lues dans `API_KEYS`\n"
+            "  (plusieurs clés = rotation sans coupure), jamais écrites dans le code.\n"
+        )
+    if not any_auth:
+        lines.append("- ⚠️ **Aucune authentification** : n'expose pas cette API sur Internet sans en ajouter une.\n")
+    lines.append("\nL'API **refuse de démarrer** si un secret requis manque.\n")
+    if p.resources:
+        lines.append("\n## Accès par ressource\n\n| Ressource | Règle |\n|---|---|\n")
+        for r in p.resources:
+            mode = r.access if (p.users_enabled or r.access != "owner") else "shared"
+            rule = ACCESS_DOC[mode] if any_auth or mode == "public" else "accès libre (aucune authentification)"
+            lines.append(f"| `{r.route_prefix}` | {rule} |\n")
+    lines.append(
+        "\n## Mesures intégrées\n\n"
+        "- Schémas stricts : champs inconnus refusés (422), textes bornés, entiers 64 bits, décimaux sans\n"
+        "  NaN/Infini, champs requis non nullables et non vides en PATCH ; `owner_id` jamais modifiable par le client.\n"
+        "- SQL paramétré, identifiants validés à la génération, tri sur liste blanche, `LIKE` échappé,\n"
+        "  clés étrangères actives (suppression d'un compte = suppression de ses données privées).\n"
         "- Erreurs de contrainte traduites (409/422) sans fuite du SQL ni du schéma.\n"
         "- En-têtes : `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, CSP `default-src 'none'`,\n"
-        "  `Cache-Control: no-store` sur l'API, en-tête `Server` supprimé, HSTS optionnel.\n"
-        "- Limite de taille du corps (413) et de débit par IP (429 + `Retry-After`).\n"
-        "- CORS restreint aux méthodes réellement exposées, sans cookies (`allow_credentials=False`).\n"
+        "  `Cache-Control: no-store`, en-tête `Server` supprimé, HSTS optionnel.\n"
+        "- Limite de taille du corps (413). Limitation de débit par IP (429 + `Retry-After`), plus stricte sur\n"
+        "  les routes d'authentification, **partagée entre workers** (SQLite) ou **entre machines** (Redis).\n"
+        "- CORS restreint aux méthodes et en-têtes utilisés, sans cookies.\n"
         "- Conteneur non-root, healthcheck, base SQLite dans un volume.\n\n"
-        "## Variables d'environnement\n\n"
-        "| Variable | Défaut | Rôle |\n|---|---|---|\n"
-        + ("| `API_KEYS` | *(obligatoire)* | Clés acceptées, séparées par des virgules (16 caractères min.) |\n"
-           if p.api_key_enabled else "")
-        + f"| `CORS_ORIGINS` | `{p.cors_origins if p.cors else ''}` | Origines autorisées (vide = CORS désactivé) |\n"
-        "| `ALLOWED_HOSTS` | *(vide = tous)* | Valeurs acceptées pour l'en-tête `Host`, ex. `api.exemple.fr` |\n"
-        f"| `RATE_LIMIT_PER_MINUTE` | `{p.rate_limit}` | Requêtes par minute et par IP (`0` = désactivé) |\n"
-        f"| `MAX_BODY_BYTES` | `{p.max_body_kb * 1024}` | Taille maximale d'un corps de requête |\n"
-        f"| `DOCS_ENABLED` | `{'1' if p.docs_enabled else '0'}` | Swagger / ReDoc / OpenAPI |\n"
-        "| `HSTS` | `0` | Active `Strict-Transport-Security` (seulement derrière HTTPS) |\n"
-        "| `APIFORGE_DB` | `./data.db` | Chemin de la base SQLite |\n\n"
+        "## Variables d'environnement\n\n| Variable | Défaut | Rôle |\n|---|---|---|\n"
+    )
+    if p.api_key_enabled:
+        lines.append("| `API_KEYS` | *(obligatoire)* | Clés service, séparées par des virgules (16 car. min.) |\n")
+    if p.users_enabled:
+        lines += [
+            "| `JWT_SECRET` | *(obligatoire)* | Secret de signature des jetons (32 car. min.) |\n",
+            f"| `JWT_TTL_MINUTES` | `{p.jwt_ttl_minutes}` | Durée de validité des jetons |\n",
+            f"| `OPEN_REGISTRATION` | `{int(p.open_registration)}` | Inscriptions libres |\n",
+            "| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | *(vide)* | Compte admin créé au démarrage s'il n'existe pas |\n",
+            "| `AUTH_RATE_LIMIT_PER_MINUTE` | `10` | Tentatives de connexion/inscription par minute et par IP |\n",
+        ]
+    lines += [
+        f"| `CORS_ORIGINS` | `{p.cors_origins if p.cors else ''}` | Origines autorisées (vide = CORS désactivé) |\n",
+        "| `ALLOWED_HOSTS` | *(vide = tous)* | Valeurs acceptées pour l'en-tête `Host` |\n",
+        f"| `RATE_LIMIT_PER_MINUTE` | `{p.rate_limit}` | Requêtes par minute et par IP (`0` = désactivé) |\n",
+        "| `RATE_LIMIT_BACKEND` | `sqlite` | `sqlite` (workers d'une machine), `redis` (plusieurs machines), `memory` (dev) |\n",
+        "| `REDIS_URL` | *(vide)* | Requis si `RATE_LIMIT_BACKEND=redis`, ex. `redis://redis:6379/0` |\n",
+        f"| `MAX_BODY_BYTES` | `{p.max_body_kb * 1024}` | Taille maximale d'un corps de requête |\n",
+        f"| `DOCS_ENABLED` | `{int(p.docs_enabled)}` | Swagger / ReDoc / OpenAPI |\n",
+        "| `HSTS` | `0` | Active `Strict-Transport-Security` (seulement derrière HTTPS) |\n",
+        "| `APIFORGE_DB` | `./data.db` | Chemin de la base SQLite |\n\n",
         "## Avant la mise en production\n\n"
-        "1. Servir l'API derrière un reverse proxy **HTTPS** (Caddy, Traefik, Nginx), puis `HSTS=1`.\n"
+        "1. Servir l'API derrière un reverse proxy **HTTPS**, puis `HSTS=1`.\n"
         "2. Remplacer `CORS_ORIGINS=*` par la liste exacte des front-ends, renseigner `ALLOWED_HOSTS`.\n"
         "3. `DOCS_ENABLED=0` si la documentation ne doit pas être publique.\n"
-        "4. Derrière un proxy, définir `FORWARDED_ALLOW_IPS` (uvicorn) à l'IP du proxy pour que la\n"
-        "   limitation de débit voie la vraie IP cliente.\n"
-        "5. Le compteur de débit est propre à chaque worker : avec plusieurs workers ou instances,\n"
-        "   déléguer la limitation au reverse proxy ou à une passerelle.\n"
-        "6. Sauvegarder le volume `/data` ; ne jamais committer `.env` ni `data.db`.\n\n"
-        "## Hors périmètre\n\n"
-        "Pas de comptes utilisateurs ni de droits par ressource : toute clé valide donne accès à tout.\n"
-        "Pour du multi-utilisateur, ajouter OAuth2/JWT et un contrôle d'accès par propriétaire.\n"
+        "4. Derrière un proxy, définir `FORWARDED_ALLOW_IPS` (uvicorn) à l'IP du proxy pour que la limitation\n"
+        "   de débit voie la vraie IP cliente.\n"
+        "5. Plusieurs workers sur une machine : le défaut `sqlite` suffit. Plusieurs machines : `RATE_LIMIT_BACKEND=redis`.\n"
+        "6. Générer les secrets avec `python -c \"import secrets; print(secrets.token_urlsafe(48))\"`,\n"
+        "   ne jamais committer `.env` ni `data.db`, sauvegarder le volume `/data`.\n",
+    ]
+    return "".join(lines)
+
+
+def _requirements(p: Project) -> str:
+    reqs = ["fastapi>=0.110,<1.0", "uvicorn[standard]>=0.29,<1.0", "pydantic>=2.5,<3.0"]
+    if p.users_enabled:
+        reqs += ["pyjwt>=2.8,<3.0", "python-multipart>=0.0.9"]
+    reqs.append("# redis>=5.0  # à décommenter si RATE_LIMIT_BACKEND=redis")
+    return "\n".join(reqs) + "\n"
+
+
+def _env_example(p: Project) -> str:
+    gen = '# Générer : python -c "import secrets; print(secrets.token_urlsafe(48))"\n'
+    out = ""
+    if p.api_key_enabled or p.users_enabled:
+        out += gen
+    if p.api_key_enabled:
+        out += "API_KEYS=remplace-moi-par-une-cle-aleatoire\n"
+    if p.users_enabled:
+        out += ("JWT_SECRET=remplace-moi-par-un-secret-aleatoire-de-48-caracteres\n"
+                f"JWT_TTL_MINUTES={p.jwt_ttl_minutes}\n"
+                f"OPEN_REGISTRATION={int(p.open_registration)}\n"
+                "ADMIN_EMAIL=admin@exemple.fr\nADMIN_PASSWORD=remplace-moi-12-caracteres-min\n"
+                "AUTH_RATE_LIMIT_PER_MINUTE=10\n")
+    return out + (
+        f"CORS_ORIGINS={p.cors_origins if p.cors else ''}\n"
+        "ALLOWED_HOSTS=\n"
+        f"RATE_LIMIT_PER_MINUTE={p.rate_limit}\n"
+        "RATE_LIMIT_BACKEND=sqlite\n"
+        "REDIS_URL=\n"
+        f"MAX_BODY_BYTES={p.max_body_kb * 1024}\n"
+        f"DOCS_ENABLED={int(p.docs_enabled)}\n"
+        "HSTS=0\n"
+        "APIFORGE_DB=./data.db\n"
     )
 
 
@@ -701,16 +1161,21 @@ def generate_files(p: Project) -> dict[str, str]:
     main = generate_main(p)
     port = int(p.port)
     routes = "\n".join(f"| `{r.method}` | `{r.path}` | {r.summary} |" for r in iter_routes(p))
-    auth_note = (
-        "Toutes les routes (sauf `/health`) exigent l'en-tête `X-API-Key`.\n"
-        "L'API refuse de démarrer si `API_KEYS` n'est pas défini.\n"
-        if p.api_key_enabled else "Aucune authentification n'est activée.\n"
-    )
-    run_env = "export API_KEYS=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n" \
-        if p.api_key_enabled else ""
+    run_env = ""
+    if p.api_key_enabled:
+        run_env += "export API_KEYS=$(python -c 'import secrets; print(secrets.token_urlsafe(48))')\n"
+    if p.users_enabled:
+        run_env += ("export JWT_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(48))')\n"
+                    "export ADMIN_EMAIL=admin@exemple.fr ADMIN_PASSWORD='un-mot-de-passe-long'\n")
+    auth_note = []
+    if p.users_enabled:
+        auth_note.append("Connexion : `POST /auth/token` (OAuth2 mot de passe) puis `Authorization: Bearer <jeton>`.")
+    if p.api_key_enabled:
+        auth_note.append("Accès service : en-tête `X-API-Key`.")
+    auth_text = "\n".join(auth_note) or "Aucune authentification n'est activée."
     return {
         "main.py": main,
-        "requirements.txt": "fastapi>=0.110,<1.0\nuvicorn[standard]>=0.29,<1.0\npydantic>=2.5,<3.0\n",
+        "requirements.txt": _requirements(p),
         "Dockerfile": (
             "FROM python:3.12-slim\n\n"
             "ENV PYTHONUNBUFFERED=1 \\\n    PYTHONDONTWRITEBYTECODE=1 \\\n    APIFORGE_DB=/data/data.db\n\n"
@@ -724,31 +1189,23 @@ def generate_files(p: Project) -> dict[str, str]:
             f"EXPOSE {port}\n\n"
             "HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \\\n"
             f"  CMD python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:{port}/health', timeout=2)\" || exit 1\n\n"
-            f'CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{port}", "--no-server-header", "--proxy-headers"]\n'
+            f'CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{port}", "--workers", "2", '
+            '"--no-server-header", "--proxy-headers"]\n'
         ),
         ".dockerignore": ".env\n*.db\n*.db-*\n__pycache__/\n.venv/\n.git/\n",
         ".gitignore": ".env\n*.db\n*.db-shm\n*.db-wal\n__pycache__/\n.venv/\n",
-        ".env.example": (
-            ("# Générer : python -c \"import secrets; print(secrets.token_urlsafe(32))\"\n"
-             "API_KEYS=remplace-moi-par-une-cle-aleatoire-de-32-caracteres\n" if p.api_key_enabled else "")
-            + f"CORS_ORIGINS={p.cors_origins if p.cors else ''}\n"
-            "ALLOWED_HOSTS=\n"
-            f"RATE_LIMIT_PER_MINUTE={p.rate_limit}\n"
-            f"MAX_BODY_BYTES={p.max_body_kb * 1024}\n"
-            f"DOCS_ENABLED={'1' if p.docs_enabled else '0'}\n"
-            "HSTS=0\n"
-            "APIFORGE_DB=./data.db\n"
-        ),
+        ".env.example": _env_example(p),
         "SECURITY.md": _security_md(p),
         "README.md": (
             f"# {_comment(p.name)}\n\n{p.description}\n\n"
             "## Démarrage\n\n```bash\npython -m venv .venv && source .venv/bin/activate\n"
             f"pip install -r requirements.txt\n{run_env}uvicorn main:app --reload --no-server-header\n```\n\n"
             f"Documentation interactive : http://127.0.0.1:{port}/docs\n\n"
-            "## Docker\n\n```bash\n"
+            "## Docker\n\n```bash\ncp .env.example .env   # puis renseigne les secrets\n"
             f"docker build -t {p.slug} .\n"
             f"docker run -p {port}:{port} --env-file .env -v {p.slug}-data:/data {p.slug}\n```\n\n"
-            f"## Sécurité\n\n{auth_note}Détails et checklist de production : [SECURITY.md](SECURITY.md).\n\n"
+            f"## Sécurité\n\n{auth_text}\n\nRègles d'accès, variables et checklist de production : "
+            "[SECURITY.md](SECURITY.md).\n\n"
             "## Routes\n\n| Méthode | Chemin | Description |\n|---|---|---|\n"
             f"{routes}\n\n"
             "Les listes acceptent `limit`, `offset`, `q` (recherche texte) et `sort` (`-champ` = décroissant) ;\n"
@@ -771,6 +1228,13 @@ def export_project(p: Project, directory: str | Path) -> Path:
 
 def iter_routes(p: Project) -> list[Route]:
     routes = [Route("GET", "/health", "État du service")]
+    if p.users_enabled:
+        routes += [
+            Route("POST", "/auth/register", "Créer un compte"),
+            Route("POST", "/auth/token", "Se connecter"),
+            Route("GET", "/auth/me", "Mon compte"),
+            Route("POST", "/auth/password", "Changer de mot de passe"),
+        ]
     for r in p.resources:
         base = r.route_prefix
         if r.ops.get("list"):

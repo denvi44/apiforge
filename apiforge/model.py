@@ -34,6 +34,13 @@ FIELD_TYPE_LABELS = {
     "datetime": "Date & heure",
 }
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+ACCESS_MODES = {
+    "owner": "Privé : chaque utilisateur ne voit que ses données",
+    "shared": "Partagé entre utilisateurs connectés",
+    "readonly": "Lecture connectés, écriture admin",
+    "public": "Lecture publique, écriture admin",
+}
+RESERVED_PREFIXES = ("/auth", "/health", "/docs", "/redoc", "/openapi.json")
 CRUD_OPS = ("list", "get", "create", "update", "delete")
 CRUD_LABELS = {
     "list": "Lister",
@@ -55,9 +62,9 @@ RESERVED_FIELD_NAMES = {
     # attributs hérités de pydantic.BaseModel
     "json", "dict", "copy", "schema", "schema_json", "construct", "validate",
     "parse_obj", "parse_raw", "parse_file", "from_orm", "update_forward_refs", "fields",
-    "check_required_not_null",
+    "check_required_not_null", "owner_id",
 }
-RESERVED_RESOURCE_NAMES = {"custom", "health", "system", "docs", "redoc", "openapi"}
+RESERVED_RESOURCE_NAMES = {"custom", "health", "system", "docs", "redoc", "openapi", "users", "auth"}
 TRUE_VALUES = {"true", "1", "oui", "yes", "vrai"}
 FALSE_VALUES = {"false", "0", "non", "no", "faux"}
 
@@ -80,6 +87,7 @@ class Resource:
     ops: dict[str, bool] = field(default_factory=lambda: {op: True for op in CRUD_OPS})
     path: str = ""
     description: str = ""
+    access: str = "owner"  # voir ACCESS_MODES ; sans comptes utilisateurs, "owner" équivaut à "shared"
 
     @property
     def route_prefix(self) -> str:
@@ -119,6 +127,9 @@ class Project:
     rate_limit: int = 120  # requêtes / minute / IP, 0 = désactivé
     max_body_kb: int = 1024
     docs_enabled: bool = True
+    users_enabled: bool = False  # comptes utilisateurs + JWT
+    open_registration: bool = False
+    jwt_ttl_minutes: int = 60
     resources: list[Resource] = field(default_factory=list)
     endpoints: list[Endpoint] = field(default_factory=list)
 
@@ -137,6 +148,7 @@ class Project:
                 ops={op: bool(r.get("ops", {}).get(op, True)) for op in CRUD_OPS},
                 path=r.get("path", ""),
                 description=r.get("description", ""),
+                access=r.get("access", "owner"),
             )
             for r in data.pop("resources", [])
         ]
@@ -169,6 +181,7 @@ class Project:
                 Resource(
                     name="product",
                     description="Produits du catalogue",
+                    access="public",
                     fields=[
                         Field("title", "str", required=True, unique=True, description="Nom du produit"),
                         Field("price", "float", required=True),
@@ -260,6 +273,8 @@ def validate(p: Project) -> list[Issue]:
         add("project", "La limite de requêtes doit être comprise entre 0 et 100 000 par minute.")
     if not 1 <= int(p.max_body_kb) <= 1_048_576:
         add("project", "La taille maximale du corps doit être comprise entre 1 Ko et 1 Go.")
+    if p.users_enabled and not 1 <= int(p.jwt_ttl_minutes) <= 10_080:
+        add("project", "La durée de validité des jetons doit être comprise entre 1 minute et 7 jours.")
     if p.cors and not p.cors_origins.strip():
         add("project", "Indique au moins une origine CORS (ou « * »).")
     if not p.resources and not p.endpoints:
@@ -280,6 +295,10 @@ def validate(p: Project) -> list[Issue]:
 
         if r.path and not RESOURCE_PATH_RE.match(r.path):
             add(where, f"Ressource « {label} » : chemin invalide (ex. /produits).")
+        if any(r.route_prefix == x or r.route_prefix.startswith(x + "/") for x in RESERVED_PREFIXES):
+            add(where, f"Ressource « {label} » : le chemin {r.route_prefix} est réservé.")
+        if r.access not in ACCESS_MODES:
+            add(where, f"Ressource « {label} » : mode d'accès inconnu.")
         if r.route_prefix in seen_prefixes:
             add(where, f"Ressource « {label} » : chemin {r.route_prefix} déjà utilisé.")
         seen_prefixes.add(r.route_prefix)
@@ -328,6 +347,8 @@ def validate(p: Project) -> list[Issue]:
             for prm in params:
                 if keyword.iskeyword(prm) or prm in RESERVED_FIELD_NAMES:
                     add(where, f"Endpoint « {label} » : paramètre « {prm} » réservé.")
+        if any(e.path == x or e.path.startswith(x + "/") for x in RESERVED_PREFIXES):
+            add(where, f"Endpoint « {label} » : chemin réservé.")
         if (e.method, e.path) in seen_routes:
             add(where, f"Endpoint « {label} » : déclaré deux fois.")
         seen_routes.add((e.method, e.path))

@@ -9,7 +9,7 @@ import flet as ft
 
 from ...generator import GenerationError, code_hash, generate_main, iter_routes
 from ...model import HTTP_METHODS
-from ...runner import http_request
+from ...runner import dev_secret, http_request
 from ..theme import CODE_BG, CODE_FG, MONO, method_badge, page_header, section
 
 MAX_LOG_LINES = 1500
@@ -49,6 +49,13 @@ class ServerView:
         self.body = ft.TextField(label="Corps JSON (optionnel)", multiline=True, min_lines=3, max_lines=8,
                                  text_style=ft.TextStyle(font_family=MONO, size=13))
         self.send_btn = ft.FilledButton("Envoyer", icon=ft.Icons.SEND, on_click=lambda _: self._send())
+        self.identity = ft.Dropdown(label="En tant que", width=190, value="auto",
+                                    options=[ft.dropdown.Option("auto", "Automatique"),
+                                             ft.dropdown.Option("admin", "Admin (JWT)"),
+                                             ft.dropdown.Option("apikey", "Clé API"),
+                                             ft.dropdown.Option("anonymous", "Anonyme")])
+        self.token: str | None = None
+        self.admin_email = "admin@apiforge.local"
         self.progress = ft.ProgressRing(width=18, height=18, stroke_width=2, visible=False)
         self.response_meta = ft.Row(spacing=12)
         self.response_body = ft.Text(selectable=True, font_family=MONO, size=13, color=CODE_FG)
@@ -84,7 +91,7 @@ class ServerView:
                             [
                                 section(
                                     "Client HTTP", ft.Icons.SEND_OUTLINED,
-                                    ft.Row([self.method, self.url]),
+                                    ft.Row([self.method, self.url, self.identity]),
                                     self.body,
                                     ft.Row([self.send_btn, self.progress, self.response_meta],
                                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
@@ -160,8 +167,19 @@ class ServerView:
         except GenerationError as exc:
             self.app.toast(f"Génération impossible : {len(exc.issues)} problème(s). Voir l'onglet Code.", error=True)
             return
+        if p.users_enabled:
+            import importlib.util
+            missing = [name for name, mods in (("pyjwt", ("jwt",)), ("python-multipart", ("python_multipart", "multipart")))
+                       if not any(importlib.util.find_spec(m) for m in mods)]
+            if missing:
+                self.app.toast(f"Comptes utilisateurs : paquets manquants ({', '.join(missing)}).", error=True)
+                return
         try:
             env = {"API_KEYS": p.api_key} if p.api_key_enabled else {}
+            if p.users_enabled:
+                env.update(JWT_SECRET=dev_secret(p.slug, "jwt_secret", 48), ADMIN_EMAIL=self.admin_email,
+                           ADMIN_PASSWORD=dev_secret(p.slug, "admin_password", 18))
+            self.token = None
             self.app.runner.start(code, int(p.port), p.slug, env=env, code_hash=code_hash(code))
         except (RuntimeError, OSError) as exc:
             self.app.toast(str(exc), error=True)
@@ -218,6 +236,20 @@ class ServerView:
                 return json.dumps({f.name: examples[f.type] for f in r.fields}, indent=2, ensure_ascii=False)
         return ""
 
+    def _login(self) -> str | None:
+        """Connexion au compte admin du serveur intégré (créé au démarrage via ADMIN_EMAIL/ADMIN_PASSWORD)."""
+        form = urllib.parse.urlencode({"username": self.admin_email,
+                                       "password": dev_secret(self.app.project.slug, "admin_password", 18)})
+        res = http_request("POST", self.base_url + "/auth/token", form,
+                           {"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            self.token = json.loads(res.body)["access_token"] if res.status == 200 else None
+        except (ValueError, KeyError):
+            self.token = None
+        if self.token is None:
+            self.append_log(f"Connexion admin impossible (HTTP {res.status or res.error})")
+        return self.token
+
     def _send(self) -> None:
         body = (self.body.value or "").strip()
         if body:
@@ -228,14 +260,21 @@ class ServerView:
                 self.body.error_text = f"JSON invalide : {exc}"
                 self.body.update()
                 return
-        headers = {}
         p = self.app.project
-        if p.api_key_enabled and p.api_key:
-            headers["X-API-Key"] = p.api_key
+        who = self.identity.value or "auto"
+        if who == "auto":
+            who = "admin" if p.users_enabled else "apikey" if p.api_key_enabled else "anonymous"
         self.send_btn.disabled, self.progress.visible = True, True
         self.control.update()
 
         def job():
+            headers = {}
+            if who == "apikey" and p.api_key_enabled and p.api_key:
+                headers["X-API-Key"] = p.api_key
+            if who == "admin" and p.users_enabled:
+                token = self.token or self._login()
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
             res = http_request(self.method.value or "GET", (self.url.value or "").strip(),
                                body if self.method.value not in ("GET", "DELETE") else None, headers)
             self.send_btn.disabled, self.progress.visible = False, False
@@ -246,6 +285,8 @@ class ServerView:
                 color = (ft.Colors.GREEN_700 if res.status < 300 else
                          ft.Colors.ORANGE_800 if res.status < 500 else ft.Colors.RED_700)
                 label = str(res.status)
+                if res.status == 401 and who == "admin":
+                    self.token = None
                 self.response_body.value = res.pretty_body or "(corps vide)"
             self.response_meta.controls = [
                 ft.Container(ft.Text(label, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD, size=12),

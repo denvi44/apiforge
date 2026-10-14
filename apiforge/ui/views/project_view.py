@@ -63,6 +63,24 @@ class ProjectView:
             p.docs_enabled = e.control.value
             self.app.changed()
 
+        def toggle_flag(attr):
+            def handler(e):
+                setattr(p, attr, e.control.value)
+                if attr == "users_enabled":
+                    self.registration_switch.disabled = self.ttl_field.disabled = not p.users_enabled
+                    self.registration_switch.update()
+                    self.ttl_field.update()
+                self.app.changed()
+                self._refresh_dynamic()
+            return handler
+
+        self.registration_switch = ft.Switch(label="Inscription libre (POST /auth/register)",
+                                             value=p.open_registration, disabled=not p.users_enabled,
+                                             on_change=toggle_flag("open_registration"))
+        self.ttl_field = ft.TextField(label="Validité des jetons (minutes)", value=str(p.jwt_ttl_minutes), width=240,
+                                      input_filter=ft.NumbersOnlyInputFilter(), disabled=not p.users_enabled,
+                                      on_change=self._bind("jwt_ttl_minutes", int), prefix_icon=ft.Icons.TIMER_OUTLINED)
+
         self.cors_field = ft.TextField(
             label="Origines autorisées", value=p.cors_origins, disabled=not p.cors,
             on_change=self._bind("cors_origins"), hint_text="https://app.exemple.fr, https://admin.exemple.fr",
@@ -104,10 +122,21 @@ class ProjectView:
                             ft.IconButton(ft.Icons.AUTORENEW, tooltip="Générer une nouvelle clé", on_click=regenerate),
                             ft.IconButton(ft.Icons.CONTENT_COPY, tooltip="Copier", on_click=copy_key),
                         ], vertical_alignment=ft.CrossAxisAlignment.START),
-                        ft.Text("La route /health et la documentation restent publiques.",
+                        ft.Text("Accès service (droits admin). /health et la documentation restent publiques.",
                                 size=12, color=ft.Colors.ON_SURFACE_VARIANT),
                     )),
-                    ft.Container(col=12, content=section(
+                    ft.Container(col={"md": 12, "lg": 6}, content=section(
+                        "Comptes utilisateurs", ft.Icons.PEOPLE_OUTLINE,
+                        ft.Switch(label="Activer les comptes (JWT)", value=p.users_enabled,
+                                  on_change=toggle_flag("users_enabled")),
+                        self.registration_switch,
+                        self.ttl_field,
+                        ft.Text("Mots de passe scrypt, jetons révocables. Le mode d'accès de chaque ressource "
+                                "(privé, partagé, lecture seule, public) se règle dans l'onglet Ressources. "
+                                "Les clés API, si activées, donnent les droits administrateur.",
+                                size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    )),
+                    ft.Container(col={"md": 12, "lg": 6}, content=section(
                         "Protection", ft.Icons.GPP_GOOD_OUTLINED,
                         ft.Row([
                             ft.TextField(label="Requêtes / minute / IP", value=str(p.rate_limit), width=220,
@@ -119,8 +148,8 @@ class ProjectView:
                             ft.Switch(label="Documentation Swagger / ReDoc", value=p.docs_enabled,
                                       on_change=toggle_docs),
                         ], wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.START),
-                        ft.Text("Valeurs par défaut du code généré, toutes surchargeables par variables d'environnement "
-                                "(RATE_LIMIT_PER_MINUTE, MAX_BODY_BYTES, DOCS_ENABLED, ALLOWED_HOSTS…).",
+                        ft.Text("Défauts du code généré, surchargeables par l'environnement. La limite de débit est "
+                                "partagée entre workers (SQLite) ou entre machines (RATE_LIMIT_BACKEND=redis).",
                                 size=12, color=ft.Colors.ON_SURFACE_VARIANT),
                     )),
                 ],
@@ -138,8 +167,9 @@ class ProjectView:
             (ft.Icons.TABLE_CHART_OUTLINED, len(p.resources), "ressources"),
             (ft.Icons.VIEW_COLUMN_OUTLINED, sum(len(r.fields) for r in p.resources), "champs"),
             (ft.Icons.ALT_ROUTE, len(routes), "routes"),
-            (ft.Icons.LOCK_OUTLINE if p.api_key_enabled else ft.Icons.LOCK_OPEN, None,
-             "clé API" if p.api_key_enabled else "accès libre"),
+            (ft.Icons.LOCK_OUTLINE if (p.api_key_enabled or p.users_enabled) else ft.Icons.LOCK_OPEN, None,
+             " + ".join(x for x, on in (("comptes JWT", p.users_enabled), ("clé API", p.api_key_enabled)) if on)
+             or "accès libre"),
         ]
         self.stats.controls = [
             ft.Container(

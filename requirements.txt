@@ -4,5 +4,8 @@ flet==0.28.3
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.5
+pyjwt>=2.8
+python-multipart>=0.0.9
+# redis>=5.0  # optionnel : RATE_LIMIT_BACKEND=redis
 # Tests de bout en bout (TestClient)
 httpx>=0.27

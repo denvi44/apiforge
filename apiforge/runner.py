@@ -31,6 +31,24 @@ def runtime_missing() -> list[str]:
     return [m for m in ("fastapi", "uvicorn", "pydantic") if importlib.util.find_spec(m) is None]
 
 
+def dev_secret(project_slug: str, name: str, length: int = 32) -> str:
+    """Secret du serveur intégré, stable d'un démarrage à l'autre (fichier lisible par l'utilisateur seul)."""
+    import secrets
+    path = APP_DIR / "run" / project_slug / f".{name}"
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    value = secrets.token_urlsafe(length)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(value)
+    return value
+
+
 class ServerRunner:
     """Pilote un process uvicorn. Les callbacks sont appelés depuis un thread de lecture."""
 
@@ -128,7 +146,7 @@ def http_request(method: str, url: str, body: str | None = None, headers: dict[s
                  timeout: float = 15.0) -> HttpResult:
     data = body.encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, method=method, headers={"Accept": "application/json", **(headers or {})})
-    if data:
+    if data and not any(k.lower() == "content-type" for k in (headers or {})):
         req.add_header("Content-Type", "application/json")
     local = urllib.parse.urlsplit(url).hostname in ("127.0.0.1", "localhost", "::1")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if local else urllib.request.build_opener()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import flet as ft
 
-from ...model import CRUD_LABELS, CRUD_OPS, FIELD_TYPE_LABELS, FIELD_TYPES, Field, Resource, _check_ident, validate
+from ...model import ACCESS_MODES, CRUD_LABELS, CRUD_OPS, FIELD_TYPE_LABELS, FIELD_TYPES, Field, Resource, _check_ident, validate
 from ..theme import MONO, empty_state, issues_banner, method_badge, page_header, section
 
 
@@ -159,6 +159,12 @@ class ResourcesView:
                                      on_change=set_attr("path"), expand=1, text_style=ft.TextStyle(font_family=MONO)),
                     ]),
                     ft.TextField(label="Description", value=r.description, on_change=set_attr("description")),
+                    ft.Dropdown(
+                        label="Accès", value=r.access, expand=True,
+                        options=[ft.dropdown.Option(key=k, text=v) for k, v in ACCESS_MODES.items()],
+                        on_change=set_attr("access"),
+                    ),
+                    ft.Text(self._access_hint(r), size=12, color=ft.Colors.ON_SURFACE_VARIANT),
                     ft.Row([ft.Text("Préfixe des routes :"), self.prefix_preview]),
                     trailing=ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=ft.Colors.ERROR,
                                            tooltip="Supprimer la ressource",
@@ -183,6 +189,15 @@ class ResourcesView:
             expand=True,
             spacing=16,
         )
+
+    def _access_hint(self, r: Resource) -> str:
+        p = self.app.project
+        if not (p.users_enabled or p.api_key_enabled):
+            return ("Aucune authentification activée (onglet Projet) : tout appelant a tous les droits, "
+                    "le mode d'accès n'a donc pas d'effet.")
+        if r.access == "owner" and not p.users_enabled:
+            return "Sans comptes utilisateurs, le mode privé se comporte comme « partagé »."
+        return "Les clés API et les comptes admin ont toujours tous les droits."
 
     def _routes_preview(self, r: Resource) -> ft.Control:
         base = r.route_prefix

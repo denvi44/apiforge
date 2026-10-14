@@ -18,8 +18,8 @@ Python 3.10+. Au premier lancement, un projet d'exemple (« Boutique API ») est
 
 | Onglet | Rôle |
 |---|---|
-| **Projet** | Nom, version, description, port, CORS, protection par clé API (`X-API-Key`) |
-| **Ressources** | Tables + routes CRUD : champs typés (texte, entier, décimal, booléen, date, date-heure), requis, unique, défaut ; opérations activables une à une |
+| **Projet** | Nom, version, description, port, CORS, comptes utilisateurs (JWT), clés API service, limites de débit et de taille |
+| **Ressources** | Tables + routes CRUD : champs typés, requis, unique, défaut, longueur max ; opérations activables une à une ; mode d'accès (privé, partagé, lecture seule, public) |
 | **Endpoints** | Routes libres à réponse JSON fixe (mocks, `/version`, webhooks) ; les `{param}` du chemin sont injectés dans la réponse ; modèles prêts à l'emploi |
 | **Code** | Aperçu coloré de `main.py`, `requirements.txt`, `Dockerfile`, `README.md`, `.env.example` ; copie et export |
 | **Serveur** | Lancement uvicorn en un clic, journaux en direct, Swagger/ReDoc, client HTTP intégré (clé API ajoutée automatiquement), alerte si le projet a changé depuis le démarrage |
@@ -30,9 +30,12 @@ Raccourcis : `Ctrl+S` enregistrer · `Ctrl+O` ouvrir · `Ctrl+E` exporter · `Ct
 
 - `GET /ressources` avec `limit`, `offset`, `q` (recherche texte), `sort` (`-champ` = décroissant)
 - `POST` → 201 · `GET /{id}` → 404 si absent · `PUT` complet · `PATCH` partiel · `DELETE` → 204
+- Comptes utilisateurs optionnels : `/auth/register`, `/auth/token` (OAuth2, bouton *Authorize* de Swagger), `/auth/me`, `/auth/password` ; mots de passe scrypt, JWT révocables, admin initial via `ADMIN_EMAIL`/`ADMIN_PASSWORD`
+- Contrôle d'accès par ressource : données privées par propriétaire (404 pour les autres), partagées, lecture seule ou publiques ; écritures réservées aux admins selon le mode
+- Limitation de débit partagée entre workers (SQLite, par défaut) ou entre machines (Redis), plus stricte sur l'authentification
 - Doublon `UNIQUE` → 409, champ obligatoire ou validation → 422, clé absente → 401, corps trop gros → 413, débit dépassé → 429
 - Migration légère au démarrage : les colonnes ajoutées dans APIForge sont créées dans la base existante
-- Configuration par variables d'environnement : `API_KEYS`, `CORS_ORIGINS`, `ALLOWED_HOSTS`, `RATE_LIMIT_PER_MINUTE`, `MAX_BODY_BYTES`, `DOCS_ENABLED`, `HSTS`, `APIFORGE_DB`
+- Configuration par variables d'environnement : `API_KEYS`, `JWT_SECRET`, `OPEN_REGISTRATION`, `RATE_LIMIT_BACKEND`, `REDIS_URL`, `CORS_ORIGINS`, `ALLOWED_HOSTS`, `RATE_LIMIT_PER_MINUTE`, `MAX_BODY_BYTES`, `DOCS_ENABLED`, `HSTS`, `APIFORGE_DB`
 - Durcissement par défaut : aucun secret dans le code (refus de démarrer sans `API_KEYS`), schémas stricts et bornés, en-têtes de sécurité, limites de débit et de taille, erreurs SQL non divulguées, conteneur non-root ; l'export inclut un `SECURITY.md` avec la checklist de production
 
 ## Architecture
@@ -64,6 +67,7 @@ Les tests de bout en bout (CRUD réel via `TestClient`, clé API) s'exécutent s
 
 ## Limites connues
 
-- Pas de relations entre ressources (clés étrangères) ni d'authentification utilisateur (JWT/OAuth2).
+- Pas de relations entre ressources (clés étrangères) hormis le propriétaire des données privées.
+- Pas de gestion des comptes par API (désactivation, rôles) : elle se fait en base (`users.is_active`, `users.role`).
 - La migration n'ajoute que des colonnes : renommer ou supprimer un champ demande de supprimer `data.db` (dans `~/.apiforge/run/<projet>/` pour le serveur intégré).
 - Le serveur intégré lance `python -m uvicorn` avec l'interpréteur courant : il ne fonctionne pas dans un exécutable empaqueté (`flet pack`) sans Python installé à côté. L'export reste disponible.
