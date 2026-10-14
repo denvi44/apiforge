@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import keyword
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -54,6 +55,7 @@ RESERVED_FIELD_NAMES = {
     # attributs hérités de pydantic.BaseModel
     "json", "dict", "copy", "schema", "schema_json", "construct", "validate",
     "parse_obj", "parse_raw", "parse_file", "from_orm", "update_forward_refs", "fields",
+    "check_required_not_null",
 }
 RESERVED_RESOURCE_NAMES = {"custom", "health", "system", "docs", "redoc", "openapi"}
 TRUE_VALUES = {"true", "1", "oui", "yes", "vrai"}
@@ -68,6 +70,7 @@ class Field:
     unique: bool = False
     default: str = ""
     description: str = ""
+    max_length: int = 255  # texte uniquement : borne la taille stockée
 
 
 @dataclass
@@ -111,7 +114,11 @@ class Project:
     port: int = 8000
     cors: bool = True
     api_key_enabled: bool = False
-    api_key: str = ""
+    api_key: str = ""  # utilisée uniquement par le serveur intégré, jamais écrite dans le code généré
+    cors_origins: str = "*"
+    rate_limit: int = 120  # requêtes / minute / IP, 0 = désactivé
+    max_body_kb: int = 1024
+    docs_enabled: bool = True
     resources: list[Resource] = field(default_factory=list)
     endpoints: list[Endpoint] = field(default_factory=list)
 
@@ -247,6 +254,14 @@ def validate(p: Project) -> list[Issue]:
         add("project", "Le port doit être compris entre 1 et 65535.")
     if p.api_key_enabled and len(p.api_key) < 16:
         add("project", "La clé API doit faire au moins 16 caractères.")
+    if p.api_key_enabled and (not p.api_key.isascii() or "," in p.api_key or p.api_key != p.api_key.strip()):
+        add("project", "La clé API doit être en ASCII, sans virgule ni espace en bordure.")
+    if not 0 <= int(p.rate_limit) <= 100_000:
+        add("project", "La limite de requêtes doit être comprise entre 0 et 100 000 par minute.")
+    if not 1 <= int(p.max_body_kb) <= 1_048_576:
+        add("project", "La taille maximale du corps doit être comprise entre 1 Ko et 1 Go.")
+    if p.cors and not p.cors_origins.strip():
+        add("project", "Indique au moins une origine CORS (ou « * »).")
     if not p.resources and not p.endpoints:
         add("project", "Ajoute au moins une ressource ou un endpoint.")
 
@@ -284,8 +299,16 @@ def validate(p: Project) -> list[Issue]:
             if f.type not in FIELD_TYPES:
                 add(where, f"Champ « {flabel} » : type inconnu ({f.type}).")
                 continue
+            if f.type == "str" and not 1 <= int(f.max_length) <= 1_000_000:
+                add(where, f"Champ « {flabel} » : longueur maximale entre 1 et 1 000 000.")
             try:
-                coerce_default(f)
+                value = coerce_default(f)
+                if f.type == "str" and value is not None and len(value) > int(f.max_length):
+                    add(where, f"Champ « {flabel} » : la valeur par défaut dépasse la longueur maximale.")
+                if f.type == "int" and value is not None and not -(2 ** 63) <= value < 2 ** 63:
+                    add(where, f"Champ « {flabel} » : valeur par défaut hors limites SQLite (64 bits).")
+                if f.type == "float" and value is not None and not math.isfinite(value):
+                    raise ValueError
             except ValueError:
                 add(where, f"Champ « {flabel} » : valeur par défaut invalide pour le type {FIELD_TYPE_LABELS[f.type]}.")
 

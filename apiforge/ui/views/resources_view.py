@@ -222,7 +222,7 @@ class ResourcesView:
         header = ft.Row(
             [ft.Text(t, size=12, weight=ft.FontWeight.W_600, color=ft.Colors.ON_SURFACE_VARIANT, **kw)
              for t, kw in (("Nom", {"expand": 3}), ("Type", {"width": 170}), ("Requis", {"width": 70}),
-                           ("Unique", {"width": 70}), ("Défaut", {"expand": 2}), ("", {"width": 96}))],
+                           ("Unique", {"width": 70}), ("Max", {"width": 90}), ("Défaut", {"expand": 2}), ("", {"width": 96}))],
             spacing=8,
         )
         self.fields_column.controls = [header, *(self._field_row(r, i, f) for i, f in enumerate(r.fields))]
@@ -238,6 +238,13 @@ class ResourcesView:
                     self.fields_column.update()
                 self._touch()
             return handler
+
+        def set_max_length(e):
+            try:
+                f.max_length = int(e.control.value)
+            except (TypeError, ValueError):
+                return
+            self._touch()
 
         def move(delta):
             j = index + delta
@@ -267,6 +274,9 @@ class ResourcesView:
                                          tooltip="NOT NULL + obligatoire à la création"), width=70),
                 ft.Container(ft.Checkbox(value=f.unique, on_change=set_value("unique"),
                                          tooltip="Contrainte UNIQUE → 409 en cas de doublon"), width=70),
+                ft.TextField(value=str(f.max_length) if f.type == "str" else "—", dense=True, width=90,
+                             disabled=f.type != "str", input_filter=ft.NumbersOnlyInputFilter(),
+                             tooltip="Longueur maximale du texte", on_change=set_max_length),
                 ft.TextField(value=f.default, dense=True, expand=2, hint_text=hint, on_change=set_value("default")),
                 ft.Row([
                     ft.IconButton(ft.Icons.ARROW_UPWARD, icon_size=18, tooltip="Monter",

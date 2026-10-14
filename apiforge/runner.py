@@ -64,7 +64,8 @@ class ServerRunner:
 
             proc_env = {**os.environ, "PYTHONUNBUFFERED": "1", "APIFORGE_DB": str(workdir / "data.db"), **(env or {})}
             self._proc = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
+                [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port),
+                 "--no-server-header"],
                 cwd=workdir,
                 env=proc_env,
                 stdout=subprocess.PIPE,

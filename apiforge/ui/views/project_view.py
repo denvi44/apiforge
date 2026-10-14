@@ -34,7 +34,7 @@ class ProjectView:
         self.key_field = ft.TextField(
             label="Clé API (en-tête X-API-Key)", value=p.api_key, password=True, can_reveal_password=True,
             disabled=not p.api_key_enabled, expand=True, on_change=self._bind("api_key"),
-            helper_text="Valeur par défaut ; surchargée par la variable d'environnement API_KEY.",
+            helper_text="Pour le serveur intégré uniquement : jamais écrite dans le code (variable API_KEYS).",
         )
 
         def toggle_key(e):
@@ -54,7 +54,20 @@ class ProjectView:
 
         def toggle_cors(e):
             p.cors = e.control.value
+            self.cors_field.disabled = not p.cors
+            self.cors_field.update()
             self.app.changed()
+            self._refresh_dynamic()
+
+        def toggle_docs(e):
+            p.docs_enabled = e.control.value
+            self.app.changed()
+
+        self.cors_field = ft.TextField(
+            label="Origines autorisées", value=p.cors_origins, disabled=not p.cors,
+            on_change=self._bind("cors_origins"), hint_text="https://app.exemple.fr, https://admin.exemple.fr",
+            helper_text="Séparées par des virgules. « * » accepte toutes les origines (déconseillé en production).",
+        )
 
         def copy_key(_):
             self.app.page.set_clipboard(p.api_key)
@@ -82,8 +95,8 @@ class ProjectView:
                     )),
                     ft.Container(col={"md": 12, "lg": 5}, content=section(
                         "Sécurité & accès", ft.Icons.SHIELD_OUTLINED,
-                        ft.Switch(label="CORS ouvert (CORS_ORIGINS, * par défaut)", value=p.cors,
-                                  on_change=toggle_cors),
+                        ft.Switch(label="Activer CORS", value=p.cors, on_change=toggle_cors),
+                        self.cors_field,
                         ft.Switch(label="Protéger les routes par clé API", value=p.api_key_enabled,
                                   on_change=toggle_key),
                         ft.Row([
@@ -92,6 +105,22 @@ class ProjectView:
                             ft.IconButton(ft.Icons.CONTENT_COPY, tooltip="Copier", on_click=copy_key),
                         ], vertical_alignment=ft.CrossAxisAlignment.START),
                         ft.Text("La route /health et la documentation restent publiques.",
+                                size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    )),
+                    ft.Container(col=12, content=section(
+                        "Protection", ft.Icons.GPP_GOOD_OUTLINED,
+                        ft.Row([
+                            ft.TextField(label="Requêtes / minute / IP", value=str(p.rate_limit), width=220,
+                                         input_filter=ft.NumbersOnlyInputFilter(), helper_text="0 = illimité",
+                                         on_change=self._bind("rate_limit", int), prefix_icon=ft.Icons.SPEED),
+                            ft.TextField(label="Taille max. du corps (Ko)", value=str(p.max_body_kb), width=220,
+                                         input_filter=ft.NumbersOnlyInputFilter(), helper_text="Au-delà : 413",
+                                         on_change=self._bind("max_body_kb", int), prefix_icon=ft.Icons.DATA_USAGE),
+                            ft.Switch(label="Documentation Swagger / ReDoc", value=p.docs_enabled,
+                                      on_change=toggle_docs),
+                        ], wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.START),
+                        ft.Text("Valeurs par défaut du code généré, toutes surchargeables par variables d'environnement "
+                                "(RATE_LIMIT_PER_MINUTE, MAX_BODY_BYTES, DOCS_ENABLED, ALLOWED_HOSTS…).",
                                 size=12, color=ft.Colors.ON_SURFACE_VARIANT),
                     )),
                 ],

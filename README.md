@@ -30,9 +30,10 @@ Raccourcis : `Ctrl+S` enregistrer · `Ctrl+O` ouvrir · `Ctrl+E` exporter · `Ct
 
 - `GET /ressources` avec `limit`, `offset`, `q` (recherche texte), `sort` (`-champ` = décroissant)
 - `POST` → 201 · `GET /{id}` → 404 si absent · `PUT` complet · `PATCH` partiel · `DELETE` → 204
-- Violation `UNIQUE` / `NOT NULL` → 409, validation → 422, clé absente → 401
+- Doublon `UNIQUE` → 409, champ obligatoire ou validation → 422, clé absente → 401, corps trop gros → 413, débit dépassé → 429
 - Migration légère au démarrage : les colonnes ajoutées dans APIForge sont créées dans la base existante
-- Configuration par variables d'environnement : `API_KEY`, `CORS_ORIGINS`, `APIFORGE_DB`, `HOST`, `PORT`
+- Configuration par variables d'environnement : `API_KEYS`, `CORS_ORIGINS`, `ALLOWED_HOSTS`, `RATE_LIMIT_PER_MINUTE`, `MAX_BODY_BYTES`, `DOCS_ENABLED`, `HSTS`, `APIFORGE_DB`
+- Durcissement par défaut : aucun secret dans le code (refus de démarrer sans `API_KEYS`), schémas stricts et bornés, en-têtes de sécurité, limites de débit et de taille, erreurs SQL non divulguées, conteneur non-root ; l'export inclut un `SECURITY.md` avec la checklist de production
 
 ## Architecture
 

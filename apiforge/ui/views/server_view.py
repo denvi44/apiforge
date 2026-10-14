@@ -161,7 +161,8 @@ class ServerView:
             self.app.toast(f"Génération impossible : {len(exc.issues)} problème(s). Voir l'onglet Code.", error=True)
             return
         try:
-            self.app.runner.start(code, int(p.port), p.slug, code_hash=code_hash(code))
+            env = {"API_KEYS": p.api_key} if p.api_key_enabled else {}
+            self.app.runner.start(code, int(p.port), p.slug, env=env, code_hash=code_hash(code))
         except (RuntimeError, OSError) as exc:
             self.app.toast(str(exc), error=True)
             return
